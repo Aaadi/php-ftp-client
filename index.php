@@ -10,6 +10,7 @@
 //https://github.com/php-fig/log
 //https://github.com/altayalp/php-ftp-client
 
+require_once "config.php";
 require_once "vendor/autoload.php";
 use Medoo\Medoo;
 use altayalp\FtpClient\FileFactory;
@@ -18,25 +19,69 @@ use altayalp\FtpClient\Servers\FtpServer;
 
 class cronJob
 {
-    public $host;
-    public $login;
-    public $password;
-
     public $DbConnection;
+    public $saveOnDisk;
+
+    public $sourceFtpHost;
+    public $sourceFtpUser;
+    public $sourceFtpPassword;
     public $FtpServer;
 
-    function __construct($database)
+    public $destinationDirectory;
+
+    function __construct($config)
     {
-        $this->host = 'localhost';
-        $this->login = 'adnan';
-        $this->password = '123';
-        $this->DbConnection = $database;
-        // FTP connection
-        $this->FtpServer = new FtpServer($this->host);
-        $this->FtpServer->login($this->login, $this->password);
+        $this->saveOnDisk = $config['saveOnDisk'];
+        $this->sourceFtpHost = $config['sourceFtpHost'];
+        $this->sourceFtpUser = $config['sourceFtpUser'];
+        $this->sourceFtpPassword = $config['sourceFtpPassword'];
+        $this->connectDb($config);
+
+        // Source FTP connection
+        $this->FtpServer = new FtpServer($this->sourceFtpHost);
+        $this->FtpServer->login($this->sourceFtpUser, $this->sourceFtpPassword);
         $this->FtpServer->turnPassive();
 
+        // Destination FTP connection
+        $this->destinationDirectory = $config['destinationDirectory'];
+        //if backup folder is not created yet
+        if (!is_dir($this->destinationDirectory))
+        {
+            mkdir($this->destinationDirectory);
+            echo 'Backup Folder created!<br/>';
+        }
         $this->runner();
+    }
+
+    private function connectDb($config)
+    {
+        // database connection
+        $this->DbConnection = new Medoo([
+            // required
+            'database_type' => 'mysql',
+            'database_name' => $config['database_name'],
+            'server' => $config['server'],
+            'username' => $config['username'],
+            'password' => $config['password'],
+            // [optional]
+            'charset' => 'utf8mb4',
+            'collation' => 'utf8mb4_general_ci',
+            'port' => 3306,
+            // [optional] Table prefix
+            'prefix' => '',
+            // [optional] Enable logging (Logging is disabled by default for better performance)
+            'logging' => true,
+            // [optional] MySQL socket (shouldn't be used with server and port)
+            'socket' => '/tmp/mysql.sock',
+            // [optional] driver_option for connection, read more from http://www.php.net/manual/en/pdo.setattribute.php
+            'option' => [
+                PDO::ATTR_CASE => PDO::CASE_NATURAL
+            ],
+            // [optional] Medoo will execute those commands after connected to the database for initialization
+            'command' => [
+                'SET SQL_MODE=ANSI_QUOTES'
+            ]
+        ]);
     }
 
     public function runner()
@@ -58,7 +103,8 @@ class cronJob
                 $dirs = $this->getAllDir($item['path']);
                 $this->saveFileDir($files, $dirs);
                 // update parent directory status to 1
-                $response = $this->DbConnection->update("ftpfiles", array(`status` => 1), array( id => $item['id']));
+                $response = $this->DbConnection->update("ftpfiles", array("status" => 1), array( "id" => $item['id']));
+                echo '<br/>Parent Directory: '.$item['path'].' Record successfully added!';
             }
         }
         else
@@ -78,11 +124,13 @@ class cronJob
                 }
                 else
                 {
-                    $this->downloadFiles();
+                    $res = $this->downloadFiles();
+                    if ($res && $this->saveOnDisk)
+                    {
+                        $this->UploadToDestinationFtp();
+                    }
                 }
             }
-
-
         }
     }
 
@@ -95,6 +143,7 @@ class cronJob
         //get FTP files
         $file = FileFactory::build($this->FtpServer);
         $list = $file->ls($path);
+        $list = $this->prePendPath($path, $list);
         return $list;
     }
 
@@ -106,9 +155,31 @@ class cronJob
     {
         $dir = DirectoryFactory::build($this->FtpServer);
         $list = $dir->ls($path);
+        $list = $this->prePendPath($path, $list);
         return $list;
     }
 
+    /**
+     * @param $path
+     * @param $list
+     * @return array
+     */
+    public function prePendPath($path, $list)
+    {
+        $response = array();
+        if (!empty($list))
+        {
+            foreach ($list as $item)
+            {
+                $response[] = $path.'/'.$item;
+            }
+        }
+        else
+        {
+            $response = $list;
+        }
+        return $response;
+    }
     /**
      * @param $data
      * @return bool
@@ -121,6 +192,7 @@ class cronJob
         }
         $response = $this->DbConnection->insert("ftpfiles", $data);
         //var_dump($this->DbConnection->error());exit;
+        echo '<br/>Record Successfully added!';
         return $response;
     }
 
@@ -157,37 +229,47 @@ class cronJob
         }
     }
 
-    private function downloadFiles()
+    private function downloadFiles($destination = 'backup')
     {
-        //$file->download('index.php', 'backup/local.php');
+        $records = $this->DbConnection->select("ftpfiles", "*", ["status" => 1]);
+        if (!empty($records))
+        {
+            foreach ($records as $item)
+            {
+                $to = $destination.$item['path'];
+                if ($item['type'] == 'D' && !is_dir($to))
+                {
+                    mkdir($to);
+                    $response = $this->DbConnection->update("ftpfiles", array("status" => 2), array( "id" => $item['id']));
+                    echo '<br/>Directory: '.$to.' created successfully!';
+                }
+            }
+            //download files from FTP
+            $file = FileFactory::build($this->FtpServer);
+            foreach ($records as $item)
+            {
+                $to = $destination.$item['path'];
+                if ($item['type'] == 'F')
+                {
+                    $res = $file->download($item['path'], $to);
+                    $response = $this->DbConnection->update("ftpfiles", array("status" => 2), array( "id" => $item['id']));
+                    echo '<br/>File: '.$to.' downloaded successfully!';
+                }
+            }
+
+            return false;
+        }
+        else
+        {
+            echo 'DOne!';
+            return true;
+        }
+    }
+
+    private function UploadToDestinationFtp()
+    {
+        $records = $this->DbConnection->select("ftpfiles", "*", ["status" => 2]);
     }
 }
 
-// database connection
-$database = new Medoo([
-    // required
-    'database_type' => 'mysql',
-    'database_name' => 'cron_job',
-    'server' => 'localhost',
-    'username' => 'root',
-    'password' => '',
-    // [optional]
-    'charset' => 'utf8mb4',
-    'collation' => 'utf8mb4_general_ci',
-    'port' => 3306,
-    // [optional] Table prefix
-    'prefix' => '',
-    // [optional] Enable logging (Logging is disabled by default for better performance)
-    'logging' => true,
-    // [optional] MySQL socket (shouldn't be used with server and port)
-    'socket' => '/tmp/mysql.sock',
-    // [optional] driver_option for connection, read more from http://www.php.net/manual/en/pdo.setattribute.php
-    'option' => [
-        PDO::ATTR_CASE => PDO::CASE_NATURAL
-    ],
-    // [optional] Medoo will execute those commands after connected to the database for initialization
-    'command' => [
-        'SET SQL_MODE=ANSI_QUOTES'
-    ]
-]);
-$xyz = new cronJob($database);
+$job = new cronJob($config);
